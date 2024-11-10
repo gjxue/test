@@ -40,10 +40,16 @@ std::string currentTimestamp() {
     return ss.str();
 }
 
-// Thread Pool class to manage filtering and normalization threads
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <vector>
+
 class ThreadPool {
 public:
-    ThreadPool(size_t numThreads);
+    ThreadPool(size_t numThreads, size_t maxQueueSize);
     ~ThreadPool();
 
     template<class F>
@@ -54,25 +60,32 @@ private:
     std::queue<std::function<void()>> tasks;
     std::mutex queueMutex;
     std::condition_variable condition;
+    std::condition_variable queueNotFull;  // New condition variable
     bool stop;
+    size_t maxQueueSize;
 };
 
-ThreadPool::ThreadPool(size_t numThreads) : stop(false) {
-    for (size_t i = 0; i < numThreads; ++i)
+ThreadPool::ThreadPool(size_t numThreads, size_t maxQueueSize)
+    : stop(false), maxQueueSize(maxQueueSize) {
+    for (size_t i = 0; i < numThreads; ++i) {
         workers.emplace_back([this] {
             for (;;) {
                 std::function<void()> task;
                 {
                     std::unique_lock<std::mutex> lock(this->queueMutex);
-                    this->condition.wait(lock, [this] { return this->stop || !this->tasks.empty(); });
+                    this->condition.wait(lock, [this] {
+                        return this->stop || !this->tasks.empty();
+                    });
                     if (this->stop && this->tasks.empty())
                         return;
                     task = std::move(this->tasks.front());
                     this->tasks.pop();
+                    queueNotFull.notify_one();  // Notify that a slot is free
                 }
                 task();
             }
         });
+    }
 }
 
 ThreadPool::~ThreadPool() {
@@ -81,17 +94,23 @@ ThreadPool::~ThreadPool() {
         stop = true;
     }
     condition.notify_all();
-    for (std::thread &worker : workers)
+    for (std::thread &worker : workers) {
         worker.join();
+    }
 }
 
 template<class F>
 void ThreadPool::enqueue(F f) {
     {
         std::unique_lock<std::mutex> lock(queueMutex);
+        queueNotFull.wait(lock, [this] {
+            return this->tasks.size() < maxQueueSize || stop;
+        });  // Block if queue is full
+        if (stop)
+            return;  // Prevent enqueueing after stop is requested
         tasks.emplace(std::function<void()>(f));
     }
-    condition.notify_one();
+    condition.notify_one();  // Notify a worker thread
 }
 
 // Aho-Corasick Node for building the automaton
@@ -468,7 +487,7 @@ std::string normalizeTweet(const std::string& tweet) {
     json activityStream = convertTwitterV2ToActivityStream(twitterV2Payload);
 
     // Convert the output JSON to a string and return
-    return activityStream.dump(4); // Pretty-print with an indent of 4 spaces
+    return activityStream.dump(); // Pretty-print with an indent of 4 spaces
 }
 
 // Example function to simulate processing incoming tweets
@@ -742,7 +761,7 @@ int main() {
     AhoCorasick ac(keywords);
 
     // Initialize thread pool with 4 threads
-    ThreadPool pool(6);
+    ThreadPool pool(6,5000);
 
     // Simulate streaming tweets and processing them at 5000 tweets per second
     streamTweets(ac, pool);
